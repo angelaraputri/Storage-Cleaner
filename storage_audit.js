@@ -2,7 +2,7 @@
  * Storage Auditor & Cleaner (storage_audit.js)
  * 
  * Sistem Audit & Pembersihan Penyimpanan Berbasis Node.js Native
- * Menggunakan modul bawaan: http, fs, path, crypto, child_process
+ * Menggunakan modul bawaan: http, fs, path, crypto, child_process, os
  * Tanpa dependensi eksternal (zero npm dependencies).
  */
 
@@ -10,7 +10,8 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { exec } = require('child_process');
+const os = require('os');
+const { exec, spawn } = require('child_process');
 
 const DEFAULT_PORT = 3888;
 const DEFAULT_TARGET_DIR = 'C:\\Users\\Student\\Documents\\Storage-Cleaner';
@@ -147,7 +148,6 @@ function analyzeFiles(files, targetFolder, scanDurationMs, scanErrors) {
   // Hitung total potensi hemat (duplikat + file .tmp yang bukan bagian dari duplikat yang sudah dihitung)
   let tmpSavingsBytes = 0;
   for (const tmp of tmpFiles) {
-    // Jika tmp file bukan duplikat berlebih, tambahkan ukurannya
     const inDup = duplicateGroups.some(g => g.files.some(f => f.fullPath === tmp.fullPath && !f.isOriginal));
     if (!inDup) {
       tmpSavingsBytes += tmp.sizeBytes;
@@ -245,9 +245,9 @@ async function generateSampleFiles(targetFolder) {
 
   // 3. File Raksasa (> 3 MB) - Ukuran 3.5 MB
   const giantPath = path.join(sampleDir, 'database_dump_archive.bin');
-  const giantChunk = Buffer.alloc(1024 * 1024, 'A'); // 1 MB buffer
+  const giantChunk = Buffer.alloc(1024 * 1024, 'A');
   const writeStream = fs.createWriteStream(giantPath);
-  for (let i = 0; i < 3.5; i++) {
+  for (let i = 0; i < 4; i++) {
     writeStream.write(giantChunk);
   }
   await new Promise(resolve => writeStream.end(resolve));
@@ -264,6 +264,108 @@ async function generateSampleFiles(targetFolder) {
     sampleDir,
     message: 'File sampel (Duplikat, File Raksasa > 3MB, dan File .tmp) berhasil dibuat!'
   };
+}
+
+// Buka dialog pemilih folder bawaan OS (Windows Forms / macOS / Linux)
+function openNativeFolderDialog(initialPath = '') {
+  return new Promise((resolve) => {
+    if (process.platform === 'win32') {
+      const psScript = `
+        Add-Type -AssemblyName System.Windows.Forms
+        $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dialog.Description = 'Pilih Folder Target untuk Diaudit'
+        $dialog.ShowNewFolderButton = $false
+        if ('${initialPath.replace(/'/g, "''")}') {
+          $dialog.SelectedPath = '${initialPath.replace(/'/g, "''")}'
+        }
+        $form = New-Object System.Windows.Forms.Form
+        $form.TopMost = $true
+        $form.Width = 0
+        $form.Height = 0
+        $form.ShowInTaskbar = $false
+        $result = $dialog.ShowDialog($form)
+        $form.Dispose()
+        if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+          Write-Output $dialog.SelectedPath
+        }
+      `;
+
+      const ps = spawn('powershell', ['-NoProfile', '-STA', '-Command', psScript]);
+      let output = '';
+      ps.stdout.on('data', d => { output += d.toString(); });
+      ps.on('close', () => {
+        resolve(output.trim() || null);
+      });
+      ps.on('error', () => resolve(null));
+    } else if (process.platform === 'darwin') {
+      exec(`osascript -e 'POSIX path of (choose folder with prompt "Pilih Folder Target Audit")'`, (err, stdout) => {
+        resolve(err ? null : stdout.trim());
+      });
+    } else {
+      exec('zenity --file-selection --directory --title="Pilih Folder Target Audit"', (err, stdout) => {
+        resolve(err ? null : stdout.trim());
+      });
+    }
+  });
+}
+
+// Resolusi path folder di sistem dari nama folder hasil "Upload Folder" di browser
+function resolveFolderFromSystem(folderName, sampleFiles = []) {
+  if (!folderName) return null;
+
+  const candidates = new Set();
+  candidates.add(process.cwd());
+  candidates.add(path.dirname(process.cwd()));
+
+  const home = os.homedir();
+  candidates.add(home);
+  candidates.add(path.join(home, 'Documents'));
+  candidates.add(path.join(home, 'Downloads'));
+  candidates.add(path.join(home, 'Desktop'));
+  candidates.add(path.join(home, 'Pictures'));
+  candidates.add(path.join(home, 'Videos'));
+
+  // Root drives di Windows
+  ['C:\\', 'D:\\', 'E:\\'].forEach(drive => {
+    if (fs.existsSync(drive)) candidates.add(drive);
+  });
+
+  for (const base of candidates) {
+    if (!fs.existsSync(base)) continue;
+
+    if (path.basename(base).toLowerCase() === folderName.toLowerCase()) {
+      return base;
+    }
+
+    const directChild = path.join(base, folderName);
+    if (fs.existsSync(directChild)) {
+      try {
+        if (fs.statSync(directChild).isDirectory()) {
+          return directChild;
+        }
+      } catch (e) {}
+    }
+
+    // Cek subfolder di direktori dokumen/desktop/downloads
+    try {
+      const subEntries = fs.readdirSync(base, { withFileTypes: true });
+      for (const sub of subEntries) {
+        if (sub.isDirectory()) {
+          if (sub.name.toLowerCase() === folderName.toLowerCase()) {
+            return path.join(base, sub.name);
+          }
+          const nested = path.join(base, sub.name, folderName);
+          if (fs.existsSync(nested)) {
+            try {
+              if (fs.statSync(nested).isDirectory()) return nested;
+            } catch (e) {}
+          }
+        }
+      }
+    } catch (e) {}
+  }
+
+  return null;
 }
 
 // HTML Dashboard Generator
@@ -394,10 +496,16 @@ function renderHTML() {
       background: var(--bg-surface);
       border: 1px solid var(--border);
       border-radius: 16px;
-      padding: 16px 20px;
+      padding: 18px 22px;
       margin-bottom: 28px;
       box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
       backdrop-filter: blur(12px);
+      transition: border-color 0.2s;
+    }
+
+    .target-bar.dragover {
+      border-color: var(--primary);
+      background: rgba(59, 130, 246, 0.08);
     }
 
     .target-label {
@@ -406,19 +514,22 @@ function renderHTML() {
       font-size: 13px;
       font-weight: 600;
       color: var(--text-muted);
-      margin-bottom: 10px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+      gap: 8px;
     }
 
     .target-input-group {
       display: flex;
-      gap: 12px;
+      gap: 10px;
       flex-wrap: wrap;
+      align-items: center;
     }
 
     .target-input-wrapper {
       position: relative;
       flex: 1;
-      min-width: 280px;
+      min-width: 260px;
     }
 
     .target-input-wrapper svg {
@@ -454,7 +565,7 @@ function renderHTML() {
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      padding: 12px 20px;
+      padding: 12px 18px;
       border-radius: 10px;
       font-size: 13.5px;
       font-weight: 600;
@@ -491,6 +602,7 @@ function renderHTML() {
     .btn-secondary:hover:not(:disabled) {
       background: var(--bg-card-hover);
       border-color: rgba(255, 255, 255, 0.15);
+      color: white;
     }
 
     .btn-danger {
@@ -1143,11 +1255,11 @@ function renderHTML() {
       </div>
     </header>
 
-    <!-- Target Directory Bar (Dynamic Path Input) -->
-    <div class="target-bar">
+    <!-- Target Directory Bar (Dynamic Path Input + Upload Folder Option) -->
+    <div class="target-bar" id="targetBar">
       <div class="target-label">
         <span>LOKASI FOLDER TARGET (DINAMIS)</span>
-        <span id="targetHelp">Dapat diubah secara dinamis ke folder mana pun tanpa hardcoded</span>
+        <span id="targetHelp">Pilih folder langsung tanpa perlu copy-paste manual</span>
       </div>
       <div class="target-input-group">
         <div class="target-input-wrapper">
@@ -1156,13 +1268,29 @@ function renderHTML() {
           </svg>
           <input type="text" id="targetFolderPath" class="target-input" value="${DEFAULT_TARGET_DIR}" placeholder="Masukkan path absolut folder target, contoh: C:\\Users\\Student\\Documents\\Storage-Cleaner">
         </div>
-        <button id="btnScanFolder" class="btn btn-primary">
+        <button id="btnScanFolder" class="btn btn-primary" title="Mulai analisis audit penyimpanan">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="11" cy="11" r="8"></circle>
             <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
           </svg>
           Pindai Folder
         </button>
+        <button id="btnUploadFolder" class="btn btn-secondary" title="Pilih folder secara langsung dari dialog komputer tanpa copy-paste">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="17 8 12 3 7 8"></polyline>
+            <line x1="12" y1="3" x2="12" y2="15"></line>
+          </svg>
+          Upload Folder
+        </button>
+        <button id="btnBrowseFolder" class="btn btn-secondary" title="Buka jendela Windows Explorer untuk memilih folder secara langsung">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+          </svg>
+          Pilih dari Windows
+        </button>
+        <!-- Hidden input for HTML5 webkit directory picker -->
+        <input type="file" id="folderFileInput" webkitdirectory directory multiple style="display: none;">
       </div>
     </div>
 
@@ -1282,7 +1410,7 @@ function renderHTML() {
             <path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"></path>
           </svg>
           <h3>Belum ada pemindaian</h3>
-          <p>Klik tombol <strong>"Pindai Folder"</strong> di atas untuk menemukan file duplikat berdasarkan hash SHA-256.</p>
+          <p>Klik tombol <strong>"Pindai Folder"</strong> atau <strong>"Upload Folder"</strong> untuk menganalisis file.</p>
         </div>
       </div>
     </div>
@@ -1449,7 +1577,7 @@ function renderHTML() {
     async function performScan() {
       const folderPath = document.getElementById('targetFolderPath').value.trim();
       if (!folderPath) {
-        showToast('Silakan masukkan path folder target.', true);
+        showToast('Silakan tentukan path folder target.', true);
         return;
       }
 
@@ -1788,6 +1916,130 @@ function renderHTML() {
       }
     });
 
+    // 1. Opsi "Upload Folder" langsung dari dialog komputer
+    const folderFileInput = document.getElementById('folderFileInput');
+    const btnUploadFolder = document.getElementById('btnUploadFolder');
+
+    btnUploadFolder.addEventListener('click', () => {
+      folderFileInput.click();
+    });
+
+    folderFileInput.addEventListener('change', async (e) => {
+      const files = e.target.files;
+      if (!files || files.length === 0) return;
+
+      const firstRelPath = files[0].webkitRelativePath || '';
+      const rootFolderName = firstRelPath.split('/')[0] || '';
+
+      const sampleFiles = [];
+      for (let i = 0; i < Math.min(files.length, 10); i++) {
+        if (files[i].webkitRelativePath) {
+          sampleFiles.push(files[i].webkitRelativePath);
+        }
+      }
+
+      btnUploadFolder.disabled = true;
+      btnUploadFolder.innerHTML = '<div class="spinner"></div> Menemukan folder...';
+
+      try {
+        const response = await fetch('/api/resolve-folder', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            folderName: rootFolderName,
+            sampleFiles
+          })
+        });
+
+        const data = await response.json();
+        if (response.ok && data.resolvedPath) {
+          document.getElementById('targetFolderPath').value = data.resolvedPath;
+          showToast('Folder berhasil dipilih: ' + data.resolvedPath);
+          await performScan();
+        } else {
+          // Jika tidak terdeteksi otomatis, buka dialog Windows Explorer langsung
+          showToast('Membuka dialog sistem untuk konfirmasi lokasi folder...');
+          await browseFolderFromSystem();
+        }
+      } catch (err) {
+        showToast('Terjadi kesalahan: ' + err.message, true);
+      } finally {
+        btnUploadFolder.disabled = false;
+        btnUploadFolder.innerHTML = \`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+          <polyline points="17 8 12 3 7 8"></polyline>
+          <line x1="12" y1="3" x2="12" y2="15"></line>
+        </svg> Upload Folder\`;
+        folderFileInput.value = '';
+      }
+    });
+
+    // 2. Opsi "Pilih dari Windows" (Dialog Windows Explorer Asli)
+    const btnBrowseFolder = document.getElementById('btnBrowseFolder');
+
+    async function browseFolderFromSystem() {
+      const currentPath = document.getElementById('targetFolderPath').value.trim();
+      const origContent = btnBrowseFolder.innerHTML;
+      btnBrowseFolder.disabled = true;
+      btnBrowseFolder.innerHTML = '<div class="spinner"></div> Menunggu pilihan...';
+
+      try {
+        const response = await fetch('/api/browse-folder', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ initialPath: currentPath })
+        });
+        const data = await response.json();
+        if (response.ok && data.selectedPath) {
+          document.getElementById('targetFolderPath').value = data.selectedPath;
+          showToast('Folder terpilih: ' + data.selectedPath);
+          await performScan();
+        }
+      } catch (err) {
+        showToast('Gagal membuka dialog folder: ' + err.message, true);
+      } finally {
+        btnBrowseFolder.disabled = false;
+        btnBrowseFolder.innerHTML = origContent;
+      }
+    }
+
+    btnBrowseFolder.addEventListener('click', browseFolderFromSystem);
+
+    // Drag and Drop folder ke Target Bar
+    const targetBar = document.getElementById('targetBar');
+    targetBar.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      targetBar.classList.add('dragover');
+    });
+
+    targetBar.addEventListener('dragleave', () => {
+      targetBar.classList.remove('dragover');
+    });
+
+    targetBar.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      targetBar.classList.remove('dragover');
+
+      if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+        // Cek path jika didukung browser desktop
+        const file = e.dataTransfer.files[0];
+        if (file.path) {
+          const stats = await fetch('/api/scan', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ folderPath: file.path })
+          });
+          if (stats.ok) {
+            document.getElementById('targetFolderPath').value = file.path;
+            await performScan();
+            return;
+          }
+        }
+        // Fallback trigger browse dialog
+        btnUploadFolder.click();
+      }
+    });
+
     // Pindai folder tombol click
     document.getElementById('btnScanFolder').addEventListener('click', performScan);
 
@@ -1832,7 +2084,7 @@ async function handleRequest(req, res) {
     let body = '';
     req.on('data', chunk => {
       body += chunk.toString();
-      if (body.length > 1e7) { // 10MB limit
+      if (body.length > 1e7) {
         reject(new Error('Payload too large'));
       }
     });
@@ -1873,6 +2125,37 @@ async function handleRequest(req, res) {
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(result));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // POST /api/browse-folder -> Membuka dialog pemilih folder bawaan OS
+  if (req.method === 'POST' && parsedUrl.pathname === '/api/browse-folder') {
+    try {
+      const payload = await getRequestBody();
+      const initialPath = payload.initialPath || DEFAULT_TARGET_DIR;
+      const selectedPath = await openNativeFolderDialog(initialPath);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ selectedPath }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // POST /api/resolve-folder -> Mencocokkan nama folder hasil upload ke path file sistem lokal
+  if (req.method === 'POST' && parsedUrl.pathname === '/api/resolve-folder') {
+    try {
+      const payload = await getRequestBody();
+      const resolvedPath = resolveFolderFromSystem(payload.folderName, payload.sampleFiles || []);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ resolvedPath }));
     } catch (err) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message }));
@@ -1955,7 +2238,7 @@ function startServer(port = DEFAULT_PORT) {
     console.log('='.repeat(65));
     console.log(` Server aktif di       : ${url}`);
     console.log(` Target folder default: ${DEFAULT_TARGET_DIR}`);
-    console.log(` Dukungan runtime     : Node.js (http, fs, path, crypto)`);
+    console.log(` Dukungan runtime     : Node.js (http, fs, path, crypto, os)`);
     console.log(' Membuka dashboard di browser secara otomatis...');
     console.log(' Tekan Ctrl+C untuk menghentikan server.');
     console.log('='.repeat(65));
